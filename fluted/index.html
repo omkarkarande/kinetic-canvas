@@ -47,7 +47,9 @@
 //    DISTORTION_STRENGTH — lens refraction intensity per ridge
 //    HIGHLIGHT_STRENGTH — brightness of edge highlights on ridges
 //    SHADOW_STRENGTH    — depth shading intensity across each ridge
-//    GLASS_COLOR        — final brightness (0.0–1.0)//
+//    GLASS_COLOR        — final brightness (0.0–1.0)
+//    COLOR_MODE         — true = palette-mapped color, false = monochrome
+//
 // =============================================================================
 
 // =============================================================================
@@ -127,6 +129,32 @@ const float SHADOW_STRENGTH    = 0.1;    // Depth shading across each ridge. 0 =
 // --- Color -------------------------------------------------------------------
 const float GLASS_COLOR        = 225.0 / 255.0;  // Cap brightness at 225 to reduce harshness.
 
+// Toggle between palette-mapped color and monochrome. Flip and reload.
+const bool  COLOR_MODE         = true;
+
+// Palette sampled from a fluted-glass reference photo by hue-banded averaging
+// of all chromatic pixels (excluding blacks and desaturated highlights). The
+// image has no true blues or purples — the coolest tones are teal/green-teal
+// around hue 150–180°. Stops are ordered warm → cool so the gradient traces a
+// single smooth arc through the color wheel, matching how the reference photo
+// transitions spatially from orange-dominated zones into the cool highlight.
+// A separate low-frequency noise field in main() picks which palette color to
+// use at each point, then brightness multiplies that tint — so dark regions
+// fade naturally to black without needing a black stop.
+const vec3 PALETTE_0 = vec3(124.0,  34.0,   5.0) / 255.0; // deep rust
+const vec3 PALETTE_1 = vec3(160.0,  59.0,   6.0) / 255.0; // mid rust (dominant)
+const vec3 PALETTE_2 = vec3(178.0,  88.0,   8.0) / 255.0; // hero orange
+const vec3 PALETTE_3 = vec3(201.0, 164.0,  63.0) / 255.0; // mustard / harvest gold (MCM bridge)
+const vec3 PALETTE_4 = vec3(179.0, 170.0, 138.0) / 255.0; // warm cream highlight
+const vec3 PALETTE_5 = vec3(125.0, 125.0, 102.0) / 255.0; // olive / sage
+const vec3 PALETTE_6 = vec3( 65.0,  82.0,  73.0) / 255.0; // teal (the "emerald" cool tone)
+const vec3 PALETTE_7 = vec3( 11.0,  92.0,  63.0) / 255.0; // phthalo green (deep cool anchor)
+
+// Color-field scale: how large the color regions are relative to the brightness
+// noise. Lower = larger, more distinct regions (matches the reference image
+// where orange and tan occupy clearly separated zones).
+const float COLOR_SCALE         = 0.5;
+
 // =============================================================================
 // Noise functions
 // =============================================================================
@@ -170,6 +198,26 @@ float grain(vec2 coord) {
   g1 = fract((g1 + coord.y) * (g1 + 19.19));
   g1 = fract((g1 + g1) * (g1 + g1 + 47.53));
   return g1 * 2.0 - 1.0;
+}
+
+// -- Palette lookup -----------------------------------------------------------
+// Piecewise-linear gradient through the 8 palette stops, ordered warm → cool
+// with a deliberately BIMODAL distribution: wide bands at the warm end
+// [0, 0.35] and cool end [0.65, 1.0] let those colors settle and dominate,
+// while the middle tones (mustard, cream, sage) get thin bands so they only
+// appear as quick transitions between the two poles — not as resting hues.
+// Since valueNoise clusters around 0.5, this makes middle tones flicker
+// past as noise crosses the 0.35–0.65 zone, while noise in the tails lingers
+// in the warm or cool plateau.
+vec3 paletteColor(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.20) return mix(PALETTE_0, PALETTE_1, t / 0.20);             // warm plateau
+  if (t < 0.40) return mix(PALETTE_1, PALETTE_2, (t - 0.20) / 0.20);    // warm plateau
+  if (t < 0.48) return mix(PALETTE_2, PALETTE_3, (t - 0.40) / 0.08);    // quick transition
+  if (t < 0.56) return mix(PALETTE_3, PALETTE_4, (t - 0.48) / 0.08);    // quick transition
+  if (t < 0.64) return mix(PALETTE_4, PALETTE_5, (t - 0.56) / 0.08);    // quick transition
+  if (t < 0.72) return mix(PALETTE_5, PALETTE_6, (t - 0.64) / 0.08);    // quick transition
+  return            mix(PALETTE_6, PALETTE_7, (t - 0.72) / 0.28);       // cool plateau
 }
 
 // =============================================================================
@@ -265,9 +313,24 @@ void main() {
   float brightness = noiseValue + highlight * HIGHLIGHT_STRENGTH * noiseValue;
   brightness *= (1.0 - shadow);
 
+  // -- Color selection --------------------------------------------------------
+  // Decision: A second, independent low-frequency noise field picks which
+  // palette color shows at each point — decoupled from brightness. This gives
+  // the image spatially separated color regions (an orange zone, a tan zone,
+  // etc.) instead of a single brightness-driven color ramp.
+  // The COLOR_SCALE multiplier makes color regions larger than brightness
+  // features; the vec2(11.3, 7.7) offset decorrelates this field from the
+  // main noise so the two don't line up suspiciously.
+  float colorIndex = valueNoise(driftedPosition * COLOR_SCALE + vec2(11.3, 7.7));
+  vec3 tint = paletteColor(colorIndex);
+
   // -- Output -----------------------------------------------------------------
+  // Monochrome path: brightness → grayscale, GLASS_COLOR dims pure-white harshness.
+  // Color path: tint picks the hue, brightness acts as the illumination mask
+  // (dark regions fade to black, glass highlights brighten the tint).
   brightness *= GLASS_COLOR;
-  fragColor = vec4(vec3(brightness), 1.0);
+  vec3 rgb = COLOR_MODE ? tint * brightness : vec3(brightness);
+  fragColor = vec4(rgb, 1.0);
 }`;
 
 // =============================================================================
@@ -387,7 +450,7 @@ handleResize();
 // fires at display refresh rate (60–120 Hz) and skips most frames — the
 // per-skip overhead is ~0.01ms, which is acceptable.
 
-const TARGET_FPS      = 15;
+const TARGET_FPS      = 24;
 const frameDurationMs = 1000 / TARGET_FPS;
 const startTime       = performance.now();
 let   lastFrameTime   = 0;
