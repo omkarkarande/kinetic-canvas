@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Fluted Glass FBM</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<script>
+// =============================================================================
+//
+//  Fluted Glass FBM — Animated noise refracted through vertical glass ridges
+//
+//  A full-screen WebGL2 fragment shader that renders domain-warped FBM noise
+//  viewed through vertical fluted glass. Each ridge acts as a cylindrical lens
+//  that distorts the noise horizontally. Edge highlights and shadow gradients
+//  give the glass a 3D appearance. Designed to run as a Plash (macOS) desktop
+//  wallpaper.
+//
+//  Performance budget (wallpaper = always on, must be cheap):
+//    - 4 noise evaluations per fragment (2 warp + 1 main + grain hash)
+//    - DPR capped at 1.0 — fluted glass detail doesn't benefit from retina
+//    - 15 fps cap — slow drift doesn't need higher frame rates
+//    - Uniforms that don't change per-frame are uploaded only on resize
+//    - Plash pauses the WebView when occluded; visibility API added as safety net
+//
+//  Tunable constants (all in the fragment shader):
+//    SPEED              — animation speed (0 = frozen, 100 = very fast)
+//    DRIFT_SCALE        — diagonal drift intensity (0 = none)
+//    ZOOM               — noise field zoom (* on worldPosition)
+//    WARP_STRENGTH      — how much the warp distorts the main noise
+//    STRIPE_WIDTH       — pixel width of each glass ridge (count adapts to viewport)
+//    DISTORTION_STRENGTH — lens refraction intensity per ridge
+//    HIGHLIGHT_STRENGTH — brightness of edge highlights on ridges
+//    SHADOW_STRENGTH    — depth shading intensity across each ridge
+//    GLASS_COLOR        — final brightness (0.0–1.0)//
+// =============================================================================
+
+// =============================================================================
+// 1. WebGL Context
+// =============================================================================
+
+const canvas = document.getElementById('canvas');
+
+// Decision: antialias=false — we do our own smoothstep AA on glass edges, so
+// hardware MSAA would just waste bandwidth for no visible benefit.
+// Decision: premultipliedAlpha=false — avoids unexpected blending artifacts
+// when composited over the desktop by Plash.
+const gl = canvas.getContext('webgl2', {
+  antialias: false,
+  premultipliedAlpha: false
+});
+
+if (!gl) {
+  document.body.innerHTML = 'WebGL2 required';
+  throw new Error('WebGL2 not available');
+}
+
+// =============================================================================
+// 2. Shaders
+// =============================================================================
+
+// -- Vertex shader ------------------------------------------------------------
+// Minimal pass-through. The quad vertices are already in clip space [-1,1],
+// so no model/view/projection transform is needed.
+const vertexShaderSource = `#version 300 es
+in vec2 position;
+
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}`;
+
+// -- Fragment shader ----------------------------------------------------------
+// All visual work happens here. Per-fragment pipeline:
+//   1. Convert pixel → world coordinates (aspect-corrected, zoomed, offset)
+//   2. Apply diagonal drift over time
+//   3. Compute fluted glass stripe local coords and lens refraction offset
+//   4. Domain-warp with valueNoise at refracted position (two decorrelated axes)
+//   5. Sample main noise → contrast curve
+//   6. Apply glass edge highlights and shadow gradient
+//   7. Output final brightness
+const fragmentShaderSource = `#version 300 es
+precision highp float;
+
+out vec4 fragColor;
+
+// --- Uniforms ----------------------------------------------------------------
+uniform vec2  uResolution;        // Canvas size in physical pixels
+uniform float uTime;              // Seconds since load (with random time offset)
+uniform vec2  uSpatialOffset;     // Random 2D offset — unique noise region per reload
+
+// =============================================================================
+// Tunable constants
+// =============================================================================
+// Decision: All tunables are const so the GLSL compiler can fold them into
+// the shader. Changing them requires a page reload, which is fine for a
+// wallpaper — no runtime UI needed.
+
+// --- Animation ---------------------------------------------------------------
+const float SPEED              = 40.0;   // Animation speed (0–100). 40 = gentle drift.
+const float DRIFT_SCALE        = 0.2;    // Diagonal drift intensity. 0 = no drift.
+
+// --- Noise -------------------------------------------------------------------
+const float ZOOM               = 4.0;    // Noise field zoom. Higher = smaller blobs.
+const float WARP_STRENGTH      = 1.0;    // Domain warp intensity. Higher = more distortion.
+
+// --- Glass -------------------------------------------------------------------
+const float STRIPE_WIDTH       = 30.0;   // Pixel width of each glass ridge. Count adapts to viewport.
+const float DISTORTION_STRENGTH = 0.15;  // Lens refraction per ridge. Higher = more warp.
+const float HIGHLIGHT_STRENGTH = 0.6;    // Edge highlight brightness. 0 = no highlights.
+const float SHADOW_STRENGTH    = 0.1;    // Depth shading across each ridge. 0 = flat.
+
+// --- Color -------------------------------------------------------------------
+const float GLASS_COLOR        = 225.0 / 255.0;  // Cap brightness at 225 to reduce harshness.
+
+// =============================================================================
+// Noise functions
+// =============================================================================
+
+// -- Hash: pseudo-random float from 2D coordinate -----------------------------
+// Decision: Arithmetic hash (fract/dot/multiply) instead of sin-based.
+// sin() has precision issues on some mobile GPUs and can produce visible
+// banding. This approach is portable and has good distribution.
+float hash(vec2 coordinate) {
+  coordinate = fract(coordinate * vec2(123.34, 456.21));
+  coordinate += dot(coordinate, coordinate + 45.32);
+  return fract(coordinate.x * coordinate.y);
+}
+
+// -- Value noise: smooth interpolation between hashed grid values -------------
+// Decision: Hermite smoothstep (3t²−2t³) instead of quintic (6t⁵−15t⁴+10t³).
+// The subtle derivative discontinuity of Hermite is invisible once the noise
+// is viewed through glass refraction, and it's cheaper.
+float valueNoise(vec2 coordinate) {
+  vec2 integerPart    = floor(coordinate);
+  vec2 fractionalPart = fract(coordinate);
+
+  float bottomLeft  = hash(integerPart);
+  float bottomRight = hash(integerPart + vec2(1.0, 0.0));
+  float topLeft     = hash(integerPart + vec2(0.0, 1.0));
+  float topRight    = hash(integerPart + vec2(1.0, 1.0));
+
+  vec2 blend = fractionalPart * fractionalPart * (3.0 - 2.0 * fractionalPart);
+
+  return mix(
+    mix(bottomLeft, bottomRight, blend.x),
+    mix(topLeft,    topRight,    blend.x),
+    blend.y
+  );
+}
+
+// -- Grain: static per-pixel noise for subtle texture -------------------------
+// Triple-multiply hash avoids sin() periodicity. Returns -1 to 1.
+float grain(vec2 coord) {
+  float g1 = fract(coord.x * 0.1031);
+  g1 = fract((g1 + coord.y) * (g1 + 19.19));
+  g1 = fract((g1 + g1) * (g1 + g1 + 47.53));
+  return g1 * 2.0 - 1.0;
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+void main() {
+  // -- Coordinate setup -------------------------------------------------------
+  vec2 uv = gl_FragCoord.xy / uResolution.xy;
+
+  vec2 worldPosition = uv
+    * vec2(uResolution.x / uResolution.y, 1.0)  // Aspect ratio correction
+    * ZOOM                                        // Noise field scale
+    + uSpatialOffset;                             // Random region per reload
+
+  // -- Animation timing -------------------------------------------------------
+  const float TIME_SCALE = SPEED * 0.0015;
+
+  // -- Diagonal drift ---------------------------------------------------------
+  // Decision: Normalized (1,1) direction = 45° diagonal. The drift shifts the
+  // entire noise field over time, adding a sense of directional flow on top
+  // of the organic warp motion.
+  vec2 drift = vec2(0.7071, 0.7071) * uTime * TIME_SCALE * DRIFT_SCALE;
+  vec2 driftedPosition = worldPosition + drift;
+
+  // -- Fluted glass stripe coords ---------------------------------------------
+  // Decision: Stripes are computed in pixel space (gl_FragCoord.x) with a fixed
+  // pixel width. The number of ridges adapts to the viewport — wider screens
+  // get more stripes, keeping the glass texture consistent across displays.
+  float invStripeWidth = 1.0 / STRIPE_WIDTH;
+  float localX = fract(gl_FragCoord.x * invStripeWidth);
+
+  // -- Lens refraction offset -------------------------------------------------
+  // Decision: Quadratic distortion (pow(localX, 2.0)) simulates a cylindrical
+  // lens. The offset is applied to worldPosition.x before sampling noise,
+  // so the noise appears to shift horizontally within each stripe — the glass
+  // is static, only the noise behind it is distorted.
+  float lensOffset = DISTORTION_STRENGTH * (2.0 * localX * localX - 0.5);
+
+  // -- Refracted sample position -----------------------------------------------
+  vec2 refractedPosition = driftedPosition;
+  refractedPosition.x += lensOffset;
+
+  // -- Domain warping ---------------------------------------------------------
+  // Decision: Two independent valueNoise calls (X and Y axes) with decorrelated
+  // inputs. A single scalar warp produces linear repetition; 2D warp breaks
+  // that pattern and looks more organic.
+  // The vec2(5.2, 1.3) is an arbitrary offset that decorrelates the Y warp
+  // from the X warp so they don't mirror each other.
+  // The Y axis drifts at 0.8× the X speed to further break symmetry.
+  // Total warp cost: 2 valueNoise calls = 8 hash evaluations.
+  float warpX = valueNoise(refractedPosition + uTime * TIME_SCALE);
+  float warpY = valueNoise(refractedPosition + vec2(5.2, 1.3) + uTime * TIME_SCALE * 0.8);
+
+  // -- Single noise sample with full-range contrast ---------------------------
+  // Decision: Single valueNoise call instead of multi-octave FBM. FBM averages
+  // multiple octaves which clusters output around 0.4–0.7 (never true black or
+  // white). Single noise naturally spans 0–1 with harsher transitions.
+  // smoothstep pushes the contrast further — steepens the gradient so
+  // transitions between black and white are sharper.
+  float noiseValue = valueNoise(refractedPosition + vec2(warpX, warpY) * WARP_STRENGTH);
+  noiseValue = noiseValue * noiseValue;
+  noiseValue = smoothstep(0.2, 0.8, noiseValue);
+
+  // -- Static grain layer (applied to noise, under the glass) -----------------
+  // Decision: Grain is mixed into the noise before glass effects so it looks
+  // like texture in the light source behind the glass, not on the glass itself.
+  // Layer order: noise → grain → glass (highlights/shadow/vignette).
+  const float GRAIN_STRENGTH = 0.02;
+  // Decision: Triple-multiply hash avoids sin() periodicity. Each pixel gets
+  // a unique seed from its coordinates. The large primes and fractional
+  // multiplies create enough entropy to prevent visible tiling.
+  float grainValue = grain(gl_FragCoord.xy + uSpatialOffset * 73.0);
+  noiseValue += grainValue * GRAIN_STRENGTH;
+
+  // -- Glass edge highlights --------------------------------------------------
+  // Decision: fwidth()-adaptive edge width ensures highlights are ~2px wide
+  // regardless of resolution. smoothstep on both edges (near 0 and near 1)
+  // creates thin bright lines at stripe boundaries.
+  float edgeWidth = max(0.002, fwidth(gl_FragCoord.x * invStripeWidth));
+  float highlight = 1.0 - smoothstep(0.0, edgeWidth * 2.0, localX)
+                        * smoothstep(1.0, 1.0 - edgeWidth * 2.0, localX);
+
+  // -- Shadow gradient per stripe ---------------------------------------------
+  // Decision: mix(localX, localX², 0.3) approximates pow(localX, 1.3) without
+  // the transcendental cost. Creates asymmetric darkening — brighter on the
+  // left edge, darker toward the right — giving each ridge a 3D appearance.
+  float shadow = mix(localX, localX * localX, 0.3) * SHADOW_STRENGTH;
+
+  // -- Compose: noise × glass effects -----------------------------------------
+  // Decision: Highlights are multiplied by noiseValue so stripe borders are
+  // only visible where there's light behind the glass. In dark areas the
+  // borders vanish — you can't see glass edges when there's no light to catch.
+  float brightness = noiseValue + highlight * HIGHLIGHT_STRENGTH * noiseValue;
+  brightness *= (1.0 - shadow);
+
+  // -- Output -----------------------------------------------------------------
+  brightness *= GLASS_COLOR;
+  fragColor = vec4(vec3(brightness), 1.0);
+}`;
+
+// =============================================================================
+// 3. Shader Compilation
+// =============================================================================
+
+function compileShader(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader));
+  }
+
+  return shader;
+}
+
+// =============================================================================
+// 4. Program Linking
+// =============================================================================
+
+const program = gl.createProgram();
+gl.attachShader(program, compileShader(gl.VERTEX_SHADER, vertexShaderSource));
+gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource));
+gl.linkProgram(program);
+
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  throw new Error(gl.getProgramInfoLog(program));
+}
+
+gl.useProgram(program);
+
+// =============================================================================
+// 5. Geometry — Full-screen Quad
+// =============================================================================
+// Decision: TRIANGLE_STRIP with 4 vertices. Most efficient for a full-screen
+// quad — single draw call, no index buffer, 2 triangles.
+
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,   // Bottom-left
+   1, -1,   // Bottom-right
+  -1,  1,   // Top-left
+   1,  1    // Top-right
+]), gl.STATIC_DRAW);
+
+const positionAttribute = gl.getAttribLocation(program, 'position');
+gl.enableVertexAttribArray(positionAttribute);
+gl.vertexAttribPointer(positionAttribute, 2, gl.FLOAT, false, 0, 0);
+
+// =============================================================================
+// 6. Uniform Locations
+// =============================================================================
+
+const uniforms = {
+  resolution:       gl.getUniformLocation(program, 'uResolution'),
+  time:             gl.getUniformLocation(program, 'uTime'),
+  spatialOffset:    gl.getUniformLocation(program, 'uSpatialOffset'),
+};
+
+// =============================================================================
+// 7. Randomization
+// =============================================================================
+// Decision: Each reload gets a unique starting state via two mechanisms:
+//   - randomSeed offsets the time uniform → different animation phase
+//   - spatialOffset shifts the world position → different noise region
+//
+// Time-only offset was insufficient because it just slides along the same 1D
+// path through the noise field — the spatial pattern was recognizably similar
+// on each reload. The 2D spatial offset fixes this.
+//
+// Decision: Spatial offset range is 0–100 (not 0–10,000). Large offsets
+// exposed repetition artifacts in the hash function due to fract() wrapping.
+
+const randomSeed    = Math.random() * 1e4;
+const spatialOffset = [Math.random() * 100.0, Math.random() * 100.0];
+
+gl.uniform2f(uniforms.spatialOffset, spatialOffset[0], spatialOffset[1]);
+
+// =============================================================================
+// 8. Resize Handler
+// =============================================================================
+// Decision: DPR capped at 1.0. For a background wallpaper with glass stripes,
+// retina resolution adds no visible detail but multiplies fragment count
+// proportionally. Capping at 1.0 saves ~55–75% GPU work on HiDPI.
+//
+// Decision: uResolution is uploaded here, not per-frame, because it only
+// changes on resize. Only uTime needs per-frame upload.
+
+function handleResize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.0);
+
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+}
+
+// Decision: 150ms debounce prevents dozens of redundant canvas resizes and
+// uniform uploads during a window resize drag. The visual delay is imperceptible
+// because the canvas stretches via CSS during the drag anyway.
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(handleResize, 150);
+});
+handleResize();
+
+// =============================================================================
+// 9. Render Loop
+// =============================================================================
+// Decision: 15 fps cap. Slow organic drift is visually indistinguishable at
+// 15 vs 60 fps, but the GPU duty cycle drops ~75%. The rAF callback still
+// fires at display refresh rate (60–120 Hz) and skips most frames — the
+// per-skip overhead is ~0.01ms, which is acceptable.
+
+const TARGET_FPS      = 15;
+const frameDurationMs = 1000 / TARGET_FPS;
+const startTime       = performance.now();
+let   lastFrameTime   = 0;
+let   paused          = false;
+
+function renderFrame(currentTime) {
+  if (paused) return;
+
+  if (currentTime - lastFrameTime >= frameDurationMs) {
+    lastFrameTime = currentTime;
+
+    const elapsedSeconds = (currentTime - startTime) / 1000;
+    gl.uniform1f(uniforms.time, randomSeed + elapsedSeconds);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  requestAnimationFrame(renderFrame);
+}
+
+requestAnimationFrame(renderFrame);
+
+// =============================================================================
+// 10. Visibility — pause when hidden to save GPU/battery
+// =============================================================================
+// Decision: Safety net beyond Plash's occlusion detection. When used in a
+// browser tab, screen sharing, or other contexts, the Page Visibility API
+// ensures we stop rendering entirely when the tab is hidden — saving GPU
+// cycles and battery.
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    paused = true;
+  } else {
+    lastFrameTime = performance.now();
+    paused = false;
+    requestAnimationFrame(renderFrame);
+  }
+});
+</script>
+</body>
+</html>

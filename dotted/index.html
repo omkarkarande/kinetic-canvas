@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Dotted FBM</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<script>
+// =============================================================================
+//
+//  Dotted FBM — Animated halftone dot-grid wallpaper
+//
+//  A full-screen WebGL2 fragment shader that renders a grid of white dots on
+//  black. Dot radii are driven by domain-warped FBM noise, producing slow
+//  organic motion. Designed to run as a Plash (macOS) desktop wallpaper.
+//
+//  Performance budget (wallpaper = always on, must be cheap):
+//    - 8 noise evaluations per fragment (2-octave warp × 2 axes + 4-octave main)
+//    - DPR capped at 1.0 — retina adds no visible detail at 8px dot cells
+//    - 24 fps cap — slow drift doesn't need 60 fps
+//    - Uniforms that don't change per-frame are uploaded only on resize
+//    - Plash pauses the WebView when occluded, so no visibility API needed
+//
+//  Tunable constants (all in the fragment shader):
+//    SPEED       — animation speed (0 = frozen, 100 = very fast)
+//    DRIFT_SCALE — diagonal drift intensity (0 = none)
+//    ZOOM        — noise field zoom (* on worldPosition)
+//    WARP_STRENGTH — how much the warp distorts the main noise
+//    CELL_SIZE   — dot grid cell in CSS pixels
+//    DOT_SOFTNESS — anti-alias band width in pixels
+//    DOT_COLOR   — final dot brightness (0.0–1.0)
+//    FADE_*      — per-edge vignette distances
+//
+// =============================================================================
+
+// =============================================================================
+// 1. WebGL Context
+// =============================================================================
+
+const canvas = document.getElementById('canvas');
+
+// Decision: antialias=false — we do our own smoothstep AA on dot edges, so
+// hardware MSAA would just waste bandwidth for no visible benefit.
+// Decision: premultipliedAlpha=false — avoids unexpected blending artifacts
+// when composited over the desktop by Plash.
+const gl = canvas.getContext('webgl2', {
+  antialias: false,
+  premultipliedAlpha: false
+});
+
+if (!gl) {
+  document.body.innerHTML = 'WebGL2 required';
+  throw new Error('WebGL2 not available');
+}
+
+// =============================================================================
+// 2. Shaders
+// =============================================================================
+
+// -- Vertex shader ------------------------------------------------------------
+// Minimal pass-through. The quad vertices are already in clip space [-1,1],
+// so no model/view/projection transform is needed.
+const vertexShaderSource = `#version 300 es
+in vec2 position;
+
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}`;
+
+// -- Fragment shader ----------------------------------------------------------
+// All visual work happens here. Per-fragment pipeline:
+//   1. Convert pixel → world coordinates (aspect-corrected, zoomed, offset)
+//   2. Apply diagonal drift over time
+//   3. Domain-warp with 2D FBM (two decorrelated axes)
+//   4. Sample main FBM → noise value
+//   5. Map noise → dot radius in a pixel-space grid cell
+//   6. Anti-alias the dot edge with smoothstep
+//   7. Apply per-edge vignette
+//   8. Output final brightness
+const fragmentShaderSource = `#version 300 es
+precision highp float;
+
+out vec4 fragColor;
+
+// --- Uniforms ----------------------------------------------------------------
+uniform vec2  uResolution;        // Canvas size in physical pixels
+uniform float uTime;              // Seconds since load (with random time offset)
+uniform float uDevicePixelRatio;  // Capped DPR for consistent dot sizing
+uniform vec2  uSpatialOffset;     // Random 2D offset — unique noise region per reload
+
+// =============================================================================
+// Tunable constants
+// =============================================================================
+// Decision: All tunables are const so the GLSL compiler can fold them into
+// the shader. Changing them requires a page reload, which is fine for a
+// wallpaper — no runtime UI needed.
+
+const float SPEED         = 40.0;   // Animation speed (0–100). 40 = gentle drift.
+const float DRIFT_SCALE   = 0.2;    // Diagonal drift intensity. 0 = no drift.
+const float ZOOM          = 3.0;    // Noise field zoom. Lower = larger blobs.
+const float WARP_STRENGTH = 0.6;    // Domain warp intensity. Higher = more distortion.
+const float CELL_SIZE     = 8.0;    // Dot grid cell in CSS pixels.
+const float DOT_SOFTNESS  = 0.6;    // AA band half-width in pixels. Lower = crisper.
+const float DOT_COLOR     = 225.0 / 255.0;  // Slightly off-white to reduce harshness.
+
+// Per-edge vignette fade distances (0.0 = no fade, 1.0 = full-screen fade).
+// Decision: Heavy top fade (0.4) creates a "light from below" look.
+// Other edges get a subtle 0.05 to soften the hard screen boundary.
+const float FADE_TOP      = 0.4;
+const float FADE_BOTTOM   = 0.05;
+const float FADE_LEFT     = 0.05;
+const float FADE_RIGHT    = 0.05;
+
+// =============================================================================
+// Noise functions
+// =============================================================================
+
+// -- Hash: pseudo-random float from 2D coordinate -----------------------------
+// Decision: Arithmetic hash (fract/dot/multiply) instead of sin-based.
+// sin() has precision issues on some mobile GPUs and can produce visible
+// banding. This approach is portable and has good distribution.
+float hash(vec2 coordinate) {
+  coordinate = fract(coordinate * vec2(123.34, 456.21));
+  coordinate += dot(coordinate, coordinate + 45.32);
+  return fract(coordinate.x * coordinate.y);
+}
+
+// -- Value noise: smooth interpolation between hashed grid values -------------
+// Decision: Hermite smoothstep (3t²−2t³) instead of quintic (6t⁵−15t⁴+10t³).
+// The subtle derivative discontinuity of Hermite is invisible once quantized
+// into dot radii, and it's cheaper.
+float valueNoise(vec2 coordinate) {
+  vec2 integerPart    = floor(coordinate);
+  vec2 fractionalPart = fract(coordinate);
+
+  float bottomLeft  = hash(integerPart);
+  float bottomRight = hash(integerPart + vec2(1.0, 0.0));
+  float topLeft     = hash(integerPart + vec2(0.0, 1.0));
+  float topRight    = hash(integerPart + vec2(1.0, 1.0));
+
+  vec2 blend = fractionalPart * fractionalPart * (3.0 - 2.0 * fractionalPart);
+
+  return mix(
+    mix(bottomLeft, bottomRight, blend.x),
+    mix(topLeft,    topRight,    blend.x),
+    blend.y
+  );
+}
+
+// -- FBM (2 octaves) — used for domain warping --------------------------------
+// Decision: 2 octaves is enough for smooth organic distortion. Higher octaves
+// add sub-cell detail that gets lost when used as a coordinate offset.
+// Cost: 2 valueNoise calls = 8 hash evaluations.
+float fbmWarp(vec2 coordinate) {
+  float value     = 0.0;
+  float amplitude = 0.5;
+
+  for (int octave = 0; octave < 2; octave++) {
+    value      += amplitude * valueNoise(coordinate);
+    coordinate *= 2.0;
+    amplitude  *= 0.5;
+  }
+
+  return value;
+}
+
+// -- FBM (4 octaves) — used for dot radius ------------------------------------
+// Decision: 4 octaves (reduced from original 5). Octave 5 adds detail at
+// spatial frequencies smaller than the 8px dot cell — that detail is quantized
+// away into dot radius and is literally invisible. Saves ~20% ALU.
+// Cost: 4 valueNoise calls = 16 hash evaluations.
+float fbmMain(vec2 coordinate) {
+  float value     = 0.0;
+  float amplitude = 0.5;
+
+  for (int octave = 0; octave < 4; octave++) {
+    value      += amplitude * valueNoise(coordinate);
+    coordinate *= 2.0;
+    amplitude  *= 0.5;
+  }
+
+  return value;
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+void main() {
+  // -- Coordinate setup -------------------------------------------------------
+  vec2 uv = gl_FragCoord.xy / uResolution.xy;
+
+  vec2 worldPosition = uv
+    * vec2(uResolution.x / uResolution.y, 1.0)  // Aspect ratio correction
+    * ZOOM                                        // Noise field scale
+    + uSpatialOffset;                             // Random region per reload
+
+  // -- Animation timing -------------------------------------------------------
+  float timeScale = SPEED * 0.0015;
+
+  // -- Diagonal drift ---------------------------------------------------------
+  // Decision: Normalized (1,1) direction = 45° diagonal. The drift shifts the
+  // entire noise field over time, adding a sense of directional flow on top
+  // of the organic warp motion.
+  vec2 drift = vec2(0.7071, 0.7071) * uTime * timeScale * DRIFT_SCALE;
+  vec2 driftedPosition = worldPosition + drift;
+
+  // -- Domain warping ---------------------------------------------------------
+  // Decision: Two independent fbmWarp calls (X and Y axes) with decorrelated
+  // inputs. A single scalar warp produces linear repetition; 2D warp breaks
+  // that pattern and looks more organic.
+  // The vec2(5.2, 1.3) is an arbitrary offset that decorrelates the Y warp
+  // from the X warp so they don't mirror each other.
+  // The Y axis drifts at 0.8× the X speed to further break symmetry.
+  // Total warp cost: 2 × 2 octaves = 4 valueNoise calls.
+  float warpX = fbmWarp(driftedPosition + uTime * timeScale);
+  float warpY = fbmWarp(driftedPosition + vec2(5.2, 1.3) + uTime * timeScale * 0.8);
+
+  float finalNoise = fbmMain(driftedPosition + vec2(warpX, warpY) * WARP_STRENGTH);
+
+  // -- Dot grid ---------------------------------------------------------------
+  // Decision: Grid is in pixel space (gl_FragCoord), not UV space, so dot size
+  // is resolution-independent. Cell size is in CSS pixels, scaled by DPR.
+  float cell = CELL_SIZE * uDevicePixelRatio;
+  vec2  gridOffset      = mod(gl_FragCoord.xy, cell) - cell * 0.5;
+  float distanceToCenter = length(gridOffset);
+
+  // -- Noise → dot radius -----------------------------------------------------
+  // smoothstep(0.28, 0.90, noise) maps the noise range:
+  //   < 0.28 → radius 0 (empty cell, no dot)
+  //   > 0.90 → maximum radius
+  // The * 0.48 caps max radius just under half the cell, preventing dots
+  // from touching their neighbors.
+  float dotRadius = smoothstep(0.28, 0.90, finalNoise) * cell * 0.48;
+
+  // -- Anti-aliased dot -------------------------------------------------------
+  // Decision: ±DOT_SOFTNESS smoothstep band. At DPR 1.0 with 0.6, this gives
+  // a ~1.2px transition — intentionally soft for a wallpaper aesthetic.
+  float dotMask = smoothstep(
+    dotRadius + DOT_SOFTNESS,
+    dotRadius - DOT_SOFTNESS,
+    distanceToCenter
+  );
+
+  // -- Vignette ---------------------------------------------------------------
+  float vignette = smoothstep(0.0, FADE_LEFT,   uv.x)
+                 * smoothstep(0.0, FADE_RIGHT,  1.0 - uv.x)
+                 * smoothstep(0.0, FADE_BOTTOM, uv.y)
+                 * smoothstep(0.0, FADE_TOP,    1.0 - uv.y);
+
+  // Decision: sqrt softens the falloff curve. Without it, the vignette
+  // transition is too abrupt and creates a visible hard boundary.
+  vignette = sqrt(vignette);
+
+  // -- Output -----------------------------------------------------------------
+  float brightness = dotMask * vignette * DOT_COLOR;
+  fragColor = vec4(vec3(brightness), 1.0);
+}`;
+
+// =============================================================================
+// 3. Shader Compilation
+// =============================================================================
+
+function compileShader(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader));
+  }
+
+  return shader;
+}
+
+// =============================================================================
+// 4. Program Linking
+// =============================================================================
+
+const program = gl.createProgram();
+gl.attachShader(program, compileShader(gl.VERTEX_SHADER, vertexShaderSource));
+gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource));
+gl.linkProgram(program);
+gl.useProgram(program);
+
+// =============================================================================
+// 5. Geometry — Full-screen Quad
+// =============================================================================
+// Decision: TRIANGLE_STRIP with 4 vertices. Most efficient for a full-screen
+// quad — single draw call, no index buffer, 2 triangles.
+
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,   // Bottom-left
+   1, -1,   // Bottom-right
+  -1,  1,   // Top-left
+   1,  1    // Top-right
+]), gl.STATIC_DRAW);
+
+const positionAttribute = gl.getAttribLocation(program, 'position');
+gl.enableVertexAttribArray(positionAttribute);
+gl.vertexAttribPointer(positionAttribute, 2, gl.FLOAT, false, 0, 0);
+
+// =============================================================================
+// 6. Uniform Locations
+// =============================================================================
+
+const uniforms = {
+  resolution:       gl.getUniformLocation(program, 'uResolution'),
+  time:             gl.getUniformLocation(program, 'uTime'),
+  devicePixelRatio: gl.getUniformLocation(program, 'uDevicePixelRatio'),
+  spatialOffset:    gl.getUniformLocation(program, 'uSpatialOffset'),
+};
+
+// =============================================================================
+// 7. Randomization
+// =============================================================================
+// Decision: Each reload gets a unique starting state via two mechanisms:
+//   - randomSeed offsets the time uniform → different animation phase
+//   - spatialOffset shifts the world position → different noise region
+//
+// Time-only offset was insufficient because it just slides along the same 1D
+// path through the noise field — the spatial pattern was recognizably similar
+// on each reload. The 2D spatial offset fixes this.
+//
+// Decision: Spatial offset range is 0–100 (not 0–10,000). Large offsets
+// exposed repetition artifacts in the hash function due to fract() wrapping.
+
+const randomSeed    = Math.random() * 1e4;
+const spatialOffset = [Math.random() * 100.0, Math.random() * 100.0];
+
+gl.uniform2f(uniforms.spatialOffset, spatialOffset[0], spatialOffset[1]);
+
+// =============================================================================
+// 8. Resize Handler
+// =============================================================================
+// Decision: DPR capped at 1.0. For a background wallpaper with 8px dot cells,
+// retina resolution (2x, 3x) adds no visible detail but multiplies fragment
+// count proportionally. Capping at 1.0 saves ~55–75% GPU work on HiDPI.
+//
+// Decision: uResolution and uDevicePixelRatio are uploaded here, not per-frame,
+// because they only change on resize. Only uTime needs per-frame upload.
+
+function handleResize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.0);
+
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+  gl.uniform1f(uniforms.devicePixelRatio, dpr);
+}
+
+window.addEventListener('resize', handleResize);
+handleResize();
+
+// =============================================================================
+// 9. Render Loop
+// =============================================================================
+// Decision: 24 fps cap. Slow organic drift is visually indistinguishable at
+// 24 vs 60 fps, but the GPU duty cycle drops ~60%. The rAF callback still
+// fires at display refresh rate (60–120 Hz) and skips most frames — the
+// per-skip overhead is ~0.01ms, which is acceptable.
+
+const TARGET_FPS      = 24;
+const frameDurationMs = 1000 / TARGET_FPS;
+const startTime       = performance.now();
+let   lastFrameTime   = 0;
+
+function renderFrame(currentTime) {
+  if (currentTime - lastFrameTime >= frameDurationMs) {
+    lastFrameTime = currentTime;
+
+    const elapsedSeconds = (currentTime - startTime) / 1000;
+    gl.uniform1f(uniforms.time, randomSeed + elapsedSeconds);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  requestAnimationFrame(renderFrame);
+}
+
+requestAnimationFrame(renderFrame);
+</script>
+</body>
+</html>
