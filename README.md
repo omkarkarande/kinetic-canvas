@@ -1,11 +1,11 @@
-# kinetic-canvas
+# Kinetic Canvas
+
+![Made with AI](https://img.shields.io/badge/Made%20with-AI-D97757)
+![Designed by Human](https://img.shields.io/badge/Designed%20by-Human-8A2BE2)
 
 Animated full-screen WebGL2 canvases — generic motion art that also happens to
 work well as live desktop wallpapers via [Plash](https://github.com/sindresorhus/Plash)
 on macOS.
-
-![Made with AI](https://img.shields.io/badge/Made%20with-AI-8A2BE2)
-![Designed by Human](https://img.shields.io/badge/Designed%20by-Human-2EA44F)
 
 Each canvas is a single self-contained `index.html`: one fragment shader,
 domain-warped FBM noise, no dependencies, no build step. Open it in any modern
