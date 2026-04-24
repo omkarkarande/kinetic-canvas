@@ -32,9 +32,19 @@ by the same warped noise field, producing a breathing halftone look.
 ### `fluted/`
 **Fluted Glass FBM** — animated noise refracted through vertical fluted glass
 ridges. Each ridge acts as a cylindrical lens with edge highlights and shadow
-gradients for a 3D glass appearance.
+gradients for a 3D glass appearance. Toggle `COLOR_MODE` for an MCM-inspired
+palette or pure monochrome.
 
-![Fluted Glass FBM preview](fluted/demo.gif)
+<table>
+  <tr>
+    <td><img src="fluted/demo-color.gif" alt="Fluted Glass FBM preview (color)" /></td>
+    <td><img src="fluted/demo-mono.gif" alt="Fluted Glass FBM preview (monochrome)" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><code>COLOR_MODE = true</code></sub></td>
+    <td align="center"><sub><code>COLOR_MODE = false</code></sub></td>
+  </tr>
+</table>
 
 ## Shared design
 
