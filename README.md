@@ -13,19 +13,28 @@ browser and it runs.
 
 ## Canvases
 
+> Previews below are sped up ~3× so motion is visible in a short clip — the
+> actual ambient pace is much slower.
+
 ### `dithered/`
 **Dithered FBM** — binary black/white pixels via an 8×8 Bayer ordered-dithering
 matrix, driven by domain-warped FBM noise. Slow organic motion with a crisp
 retro/print aesthetic.
 
+![Dithered FBM preview](dithered/demo.gif)
+
 ### `dotted/`
 **Dotted FBM** — a halftone grid of white dots on black. Dot radii are modulated
 by the same warped noise field, producing a breathing halftone look.
+
+![Dotted FBM preview](dotted/demo.gif)
 
 ### `fluted/`
 **Fluted Glass FBM** — animated noise refracted through vertical fluted glass
 ridges. Each ridge acts as a cylindrical lens with edge highlights and shadow
 gradients for a 3D glass appearance.
+
+![Fluted Glass FBM preview](fluted/demo.gif)
 
 ## Shared design
 
